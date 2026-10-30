@@ -1,7 +1,9 @@
 #include "exla_client.h"
 
+#include "absl/log/log.h"
 #include "exla_nif_util.h"
 #include "xla/layout_util.h"
+#include "xla/pjrt/distributed/distributed.h"
 #include "xla/pjrt/cpu/cpu_client.h"
 #include "xla/pjrt/gpu/gpu_helpers.h"
 #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
@@ -153,24 +155,15 @@ PjRtBufferFromBinary(xla::PjRtClient *client, ERL_NIF_TERM source_term,
 tsl::StatusOr<std::vector<std::vector<xla::PjRtBuffer *>>> UnpackRunArguments(
     ErlNifEnv *env, ExlaExecutable::RunArguments arguments,
     std::vector<std::unique_ptr<xla::PjRtBuffer>> &transient_buffers,
-    ExlaClient *client, xla::DeviceAssignment device_assignment, int device_id,
-    int num_partitions) {
+    ExlaClient *client, std::vector<int> devices) {
   std::vector<std::vector<xla::PjRtBuffer *>> arg_buffers;
   arg_buffers.reserve(arguments.size());
 
   int index = 0;
 
   for (const auto &replica_arguments : arguments) {
-    // For automatic SPMD: each input list goes to a different partition device
-    // device_assignment is (replica, partition) -> device
-    // With num_partitions > 1, we iterate through partitions (replica=0,
-    // partition=0..N-1) For replication, we iterate through replicas
-    // (replica=0..N-1, partition=0)
-    int replica = (num_partitions > 1) ? 0 : index;
-    int partition = (num_partitions > 1) ? index : 0;
-
-    auto device =
-        device_id >= 0 ? device_id : device_assignment(replica, partition);
+    // Each input list goes to the device at the same position in `devices`
+    auto device = devices.at(index);
 
     auto replica_buffers = std::vector<xla::PjRtBuffer *>();
     replica_buffers.reserve(replica_arguments.size());
@@ -219,24 +212,14 @@ tsl::StatusOr<std::vector<std::vector<xla::PjRtBuffer *>>> UnpackRunArguments(
 ExlaExecutable::RunResult
 UnpackResult(ErlNifEnv *env,
              std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>> result,
-             xla::DeviceAssignment device_assignment, int device_id,
-             ExlaClient *client) {
+             std::vector<int> devices, ExlaClient *client) {
   auto per_replica_results = std::vector<
       std::tuple<std::vector<fine::ResourcePtr<ExlaBuffer>>, int64_t>>();
 
   for (int i = 0; i < result.size(); i++) {
     auto replica_results = std::vector<fine::ResourcePtr<ExlaBuffer>>();
 
-    int64_t device;
-    if (device_id >= 0) {
-      device = device_id;
-    } else if (device_assignment.computation_count() > 1) {
-      // SPMD: results correspond to partitions (replica 0, partition i)
-      device = device_assignment(0, i);
-    } else {
-      // Replication: results correspond to replicas (replica i, partition 0)
-      device = device_assignment(i, 0);
-    }
+    int64_t device = devices.at(i);
 
     for (auto &pjrt_buf : result.at(i)) {
       pjrt_buf->GetReadyFuture().Await();
@@ -284,15 +267,17 @@ ExlaExecutable::Run(ErlNifEnv *env, ExlaExecutable::RunArguments arguments,
   // replica_args2, ...]
   std::vector<std::vector<xla::PjRtBuffer *>> input_buffers;
 
-  // the device assignment is a 2d array which maps coordinates (replica,
-  // partition) to a device
-  xla::DeviceAssignment device_assignment;
-  if (client_->client()->platform_name() == "METAL") {
-    device_assignment = xla::DeviceAssignment(1, 1);
+  // The devices that receive the argument lists and produce the results, in
+  // order. For replicated and SPMD executables these are the devices this
+  // process can address. In a multi-node client the other nodes run the same
+  // executable on their own devices at the same time.
+  std::vector<int> devices;
+  if (device_id >= 0) {
+    devices.push_back(device_id);
   } else {
-    EXLA_ASSIGN_OR_RETURN(device_assignment,
-                          client_->client()->GetDefaultDeviceAssignment(
-                              num_replicas, num_partitions));
+    for (auto device : executable_->addressable_devices()) {
+      devices.push_back(device->global_device_id().value());
+    }
   }
 
   // Buffers allocated from binaries for this specific run need to be
@@ -310,23 +295,18 @@ ExlaExecutable::Run(ErlNifEnv *env, ExlaExecutable::RunArguments arguments,
   } else {
     // else we handle unpacking/validating the run arguments to the correct
     // devices according to the device id and the device assignment
+    // For automatic SPMD: one input list per addressable partition
+    // For standard replication: one input list per addressable replica
+    if (arguments.size() != devices.size()) {
+      return xla::InvalidArgument("Got %d argument lists, expected %d "
+                                  "(num_replicas=%d, num_partitions=%d)",
+                                  arguments.size(), devices.size(),
+                                  num_replicas, num_partitions);
+    }
+
     EXLA_ASSIGN_OR_RETURN(input_buffers,
                           UnpackRunArguments(env, arguments, transient_buffers,
-                                             client_, device_assignment,
-                                             device_id, num_partitions));
-  }
-
-  // at this point input buffers is a vector of arguments per device
-  // For automatic SPMD: one input list per partition (num_partitions lists)
-  // For standard replication: one input list per replica (num_replicas lists)
-  // Each input list contains full unreplicated tensors; XLA slices based on
-  // sharding
-  int expected_lists = num_partitions > 1 ? num_partitions : num_replicas;
-  if (input_buffers.size() != expected_lists) {
-    return xla::InvalidArgument("Got %d argument lists, expected %d "
-                                "(num_replicas=%d, num_partitions=%d)",
-                                input_buffers.size(), expected_lists,
-                                num_replicas, num_partitions);
+                                             client_, devices));
   }
 
   std::vector<std::vector<std::unique_ptr<xla::PjRtBuffer>>>
@@ -361,14 +341,12 @@ ExlaExecutable::Run(ErlNifEnv *env, ExlaExecutable::RunArguments arguments,
   // EXLA_ASSIGN_OR_RETURN(per_replica_results,
   // executable_->Execute(input_buffers, options));
 
-  // sanity check - for SPMD we get results per partition, for replication per
-  // replica
-  int expected_results = num_partitions > 1 ? num_partitions : num_replicas;
-  if (per_replica_results.size() != expected_results) {
+  // sanity check - we get one result per addressable partition or replica
+  if (per_replica_results.size() != devices.size()) {
     return xla::FailedPrecondition(
         "Invalid execution: got %d results, expected %d (num_replicas=%d, "
         "num_partitions=%d)",
-        per_replica_results.size(), expected_results, num_replicas,
+        per_replica_results.size(), devices.size(), num_replicas,
         num_partitions);
   }
 
@@ -391,14 +369,17 @@ ExlaExecutable::Run(ErlNifEnv *env, ExlaExecutable::RunArguments arguments,
   // equals the number of replicas and each individual replica is a vector of
   // buffers, the inner buffer represents a flattened output because we told
   // PjRt we would always return a tuple from the computation
-  auto ret = UnpackResult(env, std::move(per_replica_results),
-                          device_assignment, device_id, client_);
+  auto ret =
+      UnpackResult(env, std::move(per_replica_results), devices, client_);
 
   return ret;
 }
 
-ExlaClient::ExlaClient(std::shared_ptr<xla::PjRtClient> client)
-    : client_(std::move(client)) {}
+ExlaClient::ExlaClient(
+    std::shared_ptr<xla::PjRtClient> client,
+    std::shared_ptr<xla::DistributedRuntimeClient> distributed_client)
+    : client_(std::move(client)),
+      distributed_client_(std::move(distributed_client)) {}
 
 tsl::StatusOr<fine::ResourcePtr<ExlaBuffer>>
 ExlaClient::BufferFromBinary(ERL_NIF_TERM source_term, xla::Shape &shape,
@@ -552,9 +533,21 @@ tsl::StatusOr<fine::ResourcePtr<ExlaClient>> GetHostClient() {
   return fine::make_resource<ExlaClient>(std::move(client));
 }
 
+tsl::StatusOr<fine::ResourcePtr<ExlaDistributedService>>
+GetDistributedService(std::string address, int num_nodes) {
+  xla::CoordinationServiceImpl::Options options;
+  options.num_nodes = num_nodes;
+
+  EXLA_ASSIGN_OR_RETURN(auto service,
+                        xla::GetDistributedRuntimeService(address, options));
+
+  return fine::make_resource<ExlaDistributedService>(std::move(service));
+}
+
 tsl::StatusOr<fine::ResourcePtr<ExlaClient>>
 GetGpuClient(double memory_fraction, bool preallocate,
-             xla::GpuAllocatorConfig::Kind kind) {
+             xla::GpuAllocatorConfig::Kind kind,
+             std::optional<DistributedOptions> distributed) {
   xla::GpuAllocatorConfig allocator_config = {.kind = kind,
                                               .memory_fraction =
                                                   memory_fraction,
@@ -562,10 +555,37 @@ GetGpuClient(double memory_fraction, bool preallocate,
 
   xla::GpuClientOptions client_options = {.allocator_config = allocator_config};
 
+  std::shared_ptr<xla::DistributedRuntimeClient> distributed_client;
+
+  if (distributed.has_value()) {
+    xla::DistributedRuntimeClient::Options options;
+    options.node_id = distributed->node_id;
+    options.init_timeout = absl::Milliseconds(distributed->init_timeout_ms);
+    // The default terminates the process, which would take down the whole VM
+    // when another node dies. Collectives involving that node fail instead.
+    options.missed_heartbeat_callback = [](const absl::Status &status) {
+      LOG(ERROR) << "EXLA distributed runtime lost a node: " << status;
+    };
+
+    distributed_client = xla::GetDistributedRuntimeClient(
+        "dns:///" + distributed->coordinator_address, options);
+    auto connect_status = distributed_client->Connect();
+    if (!connect_status.ok()) {
+      return connect_status;
+    }
+
+    client_options.node_id = distributed->node_id;
+    client_options.num_nodes = distributed->num_nodes;
+    client_options.kv_store =
+        xla::GetDistributedKeyValueStore(distributed_client, "gpu:");
+    client_options.distributed_client = distributed_client;
+  }
+
   EXLA_ASSIGN_OR_RETURN(std::unique_ptr<xla::PjRtClient> client,
                         xla::GetStreamExecutorGpuClient(client_options));
 
-  return fine::make_resource<ExlaClient>(std::move(client));
+  return fine::make_resource<ExlaClient>(std::move(client),
+                                         std::move(distributed_client));
 }
 
 tsl::StatusOr<fine::ResourcePtr<ExlaClient>> GetTpuClient() {

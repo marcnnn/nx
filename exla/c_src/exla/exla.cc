@@ -1,5 +1,6 @@
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fine.hpp>
 #include <stdexcept>
@@ -46,6 +47,7 @@ FINE_RESOURCE(mlir::Region);
 FINE_RESOURCE(exla::ExlaClient);
 FINE_RESOURCE(exla::ExlaBuffer);
 FINE_RESOURCE(exla::ExlaExecutable);
+FINE_RESOURCE(exla::ExlaDistributedService);
 FINE_RESOURCE(exla::MLIRModule);
 FINE_RESOURCE(exla::MLIRFunction);
 FINE_RESOURCE(Pending);
@@ -533,13 +535,33 @@ fine::ResourcePtr<ExlaClient> get_host_client(ErlNifEnv *env) {
 
 FINE_NIF(get_host_client, 0);
 
-fine::ResourcePtr<ExlaClient>
-get_gpu_client(ErlNifEnv *env, double memory_fraction, bool preallocate) {
+fine::ResourcePtr<ExlaClient> get_gpu_client(
+    ErlNifEnv *env, double memory_fraction, bool preallocate,
+    std::optional<std::tuple<std::string, int64_t, int64_t, int64_t>>
+        distributed) {
+  std::optional<DistributedOptions> options;
+
+  if (distributed.has_value()) {
+    auto [coordinator_address, node_id, num_nodes, init_timeout_ms] =
+        distributed.value();
+    options = DistributedOptions{coordinator_address, static_cast<int>(node_id),
+                                 static_cast<int>(num_nodes), init_timeout_ms};
+  }
+
   return unwrap(GetGpuClient(memory_fraction, preallocate,
-                             xla::GpuAllocatorConfig::Kind::kBFC));
+                             xla::GpuAllocatorConfig::Kind::kBFC, options));
 }
 
-FINE_NIF(get_gpu_client, 0);
+// Connecting blocks until all nodes have joined the coordinator
+FINE_NIF(get_gpu_client, ERL_NIF_DIRTY_JOB_IO_BOUND);
+
+fine::ResourcePtr<ExlaDistributedService>
+start_distributed_service(ErlNifEnv *env, std::string address,
+                          int64_t num_nodes) {
+  return unwrap(GetDistributedService(address, num_nodes));
+}
+
+FINE_NIF(start_distributed_service, 0);
 
 fine::ResourcePtr<ExlaClient> get_tpu_client(ErlNifEnv *env) {
   return unwrap(GetTpuClient());
@@ -580,6 +602,19 @@ int64_t get_device_count(ErlNifEnv *env, fine::ResourcePtr<ExlaClient> client) {
 }
 
 FINE_NIF(get_device_count, 0);
+
+std::vector<int64_t>
+get_addressable_device_ids(ErlNifEnv *env,
+                           fine::ResourcePtr<ExlaClient> client) {
+  std::vector<int64_t> device_ids;
+  for (auto device : client->client()->addressable_devices()) {
+    device_ids.push_back(device->global_device_id().value());
+  }
+  std::sort(device_ids.begin(), device_ids.end());
+  return device_ids;
+}
+
+FINE_NIF(get_addressable_device_ids, 0);
 
 std::map<fine::Atom, int64_t> get_supported_platforms(ErlNifEnv *env) {
   auto platforms = unwrap(xla::PlatformUtil::GetSupportedPlatforms());
@@ -669,6 +704,19 @@ get_compiled_memory_stats(ErlNifEnv *env,
 }
 
 FINE_NIF(get_compiled_memory_stats, 0);
+
+// The devices that run receives one argument list for, in order
+std::vector<int64_t>
+get_executable_device_ids(ErlNifEnv *env,
+                          fine::ResourcePtr<ExlaExecutable> executable) {
+  std::vector<int64_t> device_ids;
+  for (auto device : executable->executable()->addressable_devices()) {
+    device_ids.push_back(device->global_device_id().value());
+  }
+  return device_ids;
+}
+
+FINE_NIF(get_executable_device_ids, 0);
 
 std::string get_optimized_hlo(ErlNifEnv *env,
                               fine::ResourcePtr<ExlaExecutable> executable) {

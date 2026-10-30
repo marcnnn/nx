@@ -14,9 +14,9 @@ defmodule EXLA.Defn do
   @doc false
   def __partitions_options__(options) do
     client_name = Keyword.get_lazy(options, :client, &EXLA.Client.default_name/0)
-    device_count = EXLA.Client.fetch!(client_name).device_count
+    device_ids = EXLA.Client.fetch!(client_name).addressable_device_ids
 
-    Enum.map(1..device_count//1, &Keyword.put(options, :device_id, &1 - 1))
+    Enum.map(device_ids, &Keyword.put(options, :device_id, &1))
   end
 
   @doc false
@@ -201,14 +201,21 @@ defmodule EXLA.Defn do
          is_sharded?
        ) do
     try do
-      args = if is_sharded?, do: args, else: [args]
+      # Sharded args are pre-sliced, one arglist per partition on this node.
+      # In a multi-node client the other nodes pass their own partitions.
+      {args, device_ids} =
+        if is_sharded?,
+          do: {args, EXLA.Executable.device_ids(executable)},
+          else: {[args], [executable.device_id]}
 
-      # Check if args are pre-sliced (list of arglists for each partition)
+      if length(args) != length(device_ids) do
+        raise ArgumentError,
+              "expected #{length(device_ids)} argument lists, one for each partition on " <>
+                "devices #{inspect(device_ids)}, got: #{length(args)}"
+      end
+
       input_lists =
-        Enum.with_index(args, fn partition_args, partition_index ->
-          # executable.device_id is -1 for sharded executables; use the partition index instead.
-          target_device_id = if is_sharded?, do: partition_index, else: executable.device_id
-
+        Enum.zip_with(args, device_ids, fn partition_args, target_device_id ->
           EXLA.Defn.Buffers.filter_by_indexes(partition_args, used_inputs, fn arg, _i ->
             EXLA.Defn.Buffers.from_nx!(arg, executable, target_device_id: target_device_id)
           end)

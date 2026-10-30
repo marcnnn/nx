@@ -12,7 +12,15 @@ defmodule EXLA.Client do
   @name __MODULE__
 
   @enforce_keys [:ref, :platform, :name, :device_count, :default_device_id, :automatic_transfers]
-  defstruct [:ref, :platform, :name, :device_count, :default_device_id, :automatic_transfers]
+  defstruct [
+    :ref,
+    :platform,
+    :name,
+    :device_count,
+    :default_device_id,
+    :automatic_transfers,
+    :addressable_device_ids
+  ]
 
   @doc """
   Returns the name of the default client.
@@ -71,6 +79,23 @@ defmodule EXLA.Client do
 
         GenServer.call(@name, {:client, name, options}, :infinity)
       )
+  end
+
+  @doc """
+  Starts the coordination service for multi-node clients.
+
+  Exactly one process in the cluster must run the service, usually the
+  one with `node_id: 0`, before the clients with the `:distributed`
+  option are created. `address` is where the service listens, such as
+  `"0.0.0.0:12345"`, and `num_nodes` is the number of processes that
+  will connect to it.
+
+  The service stops when the returned reference is garbage collected,
+  so keep it around for as long as the clients are in use.
+  """
+  def start_distributed_service(address, num_nodes)
+      when is_binary(address) and is_integer(num_nodes) and num_nodes > 0 do
+    EXLA.NIF.start_distributed_service(address, num_nodes)
   end
 
   @doc """
@@ -178,10 +203,10 @@ defmodule EXLA.Client do
           EXLA.NIF.get_host_client()
 
         :cuda ->
-          EXLA.NIF.get_gpu_client(memory_fraction, preallocate)
+          EXLA.NIF.get_gpu_client(memory_fraction, preallocate, distributed_options(options))
 
         :rocm ->
-          EXLA.NIF.get_gpu_client(memory_fraction, preallocate)
+          EXLA.NIF.get_gpu_client(memory_fraction, preallocate, distributed_options(options))
 
         :tpu ->
           EXLA.NIF.get_tpu_client()
@@ -214,12 +239,14 @@ defmodule EXLA.Client do
       end
 
     device_count = EXLA.NIF.get_device_count(ref)
-    default_device_id = Keyword.get(options, :default_device_id, 0)
+    addressable_device_ids = EXLA.NIF.get_addressable_device_ids(ref)
+    default_device_id = Keyword.get(options, :default_device_id, hd(addressable_device_ids))
 
-    if default_device_id not in 0..(device_count - 1) do
+    if default_device_id not in addressable_device_ids do
       raise ArgumentError,
-            ":default_device_id #{default_device_id} is outside 0..#{device_count - 1} " <>
-              "for client #{inspect(name)} on #{inspect(platform || :host)}"
+            ":default_device_id #{default_device_id} is not one of the devices " <>
+              "#{inspect(addressable_device_ids)} of client #{inspect(name)} " <>
+              "on #{inspect(platform || :host)}"
     end
 
     automatic_transfers = Keyword.get(options, :automatic_transfers, platform == :host)
@@ -230,7 +257,27 @@ defmodule EXLA.Client do
       name: name,
       device_count: device_count,
       default_device_id: default_device_id,
-      automatic_transfers: automatic_transfers
+      automatic_transfers: automatic_transfers,
+      addressable_device_ids: addressable_device_ids
     }
+  end
+
+  defp distributed_options(options) do
+    case Keyword.get(options, :distributed) do
+      nil ->
+        nil
+
+      distributed ->
+        distributed =
+          Keyword.validate!(distributed, [
+            :coordinator,
+            :node_id,
+            :num_nodes,
+            init_timeout: 300_000
+          ])
+
+        {Keyword.fetch!(distributed, :coordinator), Keyword.fetch!(distributed, :node_id),
+         Keyword.fetch!(distributed, :num_nodes), distributed[:init_timeout]}
+    end
   end
 end

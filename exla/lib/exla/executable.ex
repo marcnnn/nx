@@ -118,6 +118,16 @@ defmodule EXLA.Executable do
   end
 
   @doc """
+  Returns the ids of the devices `run/3` expects one input list for, in order.
+
+  For replicated and sharded executables these are the devices of the
+  executable that belong to this node. In a multi-node client, the other
+  nodes run the same executable on their devices at the same time.
+  """
+  def device_ids(%Executable{device_id: device_id}) when device_id >= 0, do: [device_id]
+  def device_ids(%Executable{ref: ref}), do: EXLA.NIF.get_executable_device_ids(ref)
+
+  @doc """
   Returns the optimized HLO of the compiled executable as text.
   """
   def optimized_hlo(%Executable{ref: ref}) do

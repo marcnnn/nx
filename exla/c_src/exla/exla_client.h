@@ -4,12 +4,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "exla_types.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "xla/pjrt/distributed/client.h"
+#include "xla/pjrt/distributed/service.h"
 #include "xla/pjrt/gpu/gpu_helpers.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/shape.h"
@@ -97,7 +101,9 @@ private:
 
 class ExlaClient {
 public:
-  explicit ExlaClient(std::shared_ptr<xla::PjRtClient> client);
+  explicit ExlaClient(std::shared_ptr<xla::PjRtClient> client,
+                      std::shared_ptr<xla::DistributedRuntimeClient>
+                          distributed_client = nullptr);
 
   virtual ~ExlaClient() = default;
 
@@ -135,6 +141,9 @@ public:
 private:
   std::shared_ptr<xla::PjRtClient> client_;
 
+  // Keeps the connection to the coordinator alive for multi-node clients
+  std::shared_ptr<xla::DistributedRuntimeClient> distributed_client_;
+
   // Memory tracking state
   mutable std::mutex memory_mutex_;
   std::map<int, size_t> device_memory_;
@@ -142,11 +151,36 @@ private:
   size_t peak_memory_ = 0;
 };
 
+// The coordination service that multi-node clients connect to. Exactly one
+// process in the cluster runs it, usually the one with node id 0.
+class ExlaDistributedService {
+public:
+  explicit ExlaDistributedService(
+      std::unique_ptr<xla::DistributedRuntimeService> service)
+      : service_(std::move(service)) {}
+
+  ~ExlaDistributedService() { service_->Shutdown(); }
+
+private:
+  std::unique_ptr<xla::DistributedRuntimeService> service_;
+};
+
+struct DistributedOptions {
+  std::string coordinator_address;
+  int node_id;
+  int num_nodes;
+  int64_t init_timeout_ms;
+};
+
+tsl::StatusOr<fine::ResourcePtr<ExlaDistributedService>>
+GetDistributedService(std::string address, int num_nodes);
+
 tsl::StatusOr<fine::ResourcePtr<ExlaClient>> GetHostClient();
 
 tsl::StatusOr<fine::ResourcePtr<ExlaClient>>
 GetGpuClient(double memory_fraction, bool preallocate,
-             xla::GpuAllocatorConfig::Kind kind);
+             xla::GpuAllocatorConfig::Kind kind,
+             std::optional<DistributedOptions> distributed = std::nullopt);
 
 tsl::StatusOr<fine::ResourcePtr<ExlaClient>> GetTpuClient();
 
