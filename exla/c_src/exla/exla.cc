@@ -228,7 +228,7 @@ mlir::sdy::TensorShardingAttr mlir_create_tensor_sharding_attr(
       axis_refs.push_back(mlir::sdy::AxisRefAttr::get(context, axis));
     }
     dim_sharding_attrs.push_back(mlir::sdy::DimensionShardingAttr::get(
-        context, axis_refs, /*is_closed=*/false, /*priority=*/0));
+        context, axis_refs, /*is_closed=*/true, /*priority=*/std::nullopt));
   }
 
   return mlir::sdy::TensorShardingAttr::get(

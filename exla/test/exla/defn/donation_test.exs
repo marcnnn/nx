@@ -125,13 +125,24 @@ defmodule EXLA.Defn.DonationTest do
       assert byte_size(DeviceBuffer.read(bb)) > 0
     end
 
-    test "raises when donation is combined with sharded execution" do
-      mesh = %Nx.Mesh{name: "mesh", shape: {1}}
+    test "donates sharded arguments on every device" do
+      mesh = %Nx.Mesh{name: "mesh", shape: {2}}
 
-      assert_raise ArgumentError, ~r"not currently supported with sharded execution", fn ->
-        EXLA.shard_jit(&Nx.add(&1, 1), mesh, input_shardings: [%{}]).([
-          [Nx.donatable(on_device([1, 2, 3]))]
-        ])
+      x0 = Nx.donatable(Nx.backend_transfer(Nx.tensor([1, 2]), {EXLA.Backend, device_id: 0}))
+      x1 = Nx.donatable(Nx.backend_transfer(Nx.tensor([3, 4]), {EXLA.Backend, device_id: 1}))
+      %EXLA.Backend{buffer: %DeviceBuffer{} = b0} = x0.data
+      %EXLA.Backend{buffer: %DeviceBuffer{} = b1} = x1.data
+
+      fun = EXLA.shard_jit(&Nx.add(&1, 1), mesh, input_shardings: [%{0 => [0]}])
+      [r0, r1] = fun.([[x0], [x1]])
+
+      assert Nx.to_flat_list(r0) == [2, 3]
+      assert Nx.to_flat_list(r1) == [4, 5]
+
+      for buffer <- [b0, b1] do
+        assert_raise RuntimeError, ~r"called on deleted or donated buffer", fn ->
+          DeviceBuffer.read(buffer)
+        end
       end
     end
 

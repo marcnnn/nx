@@ -285,11 +285,6 @@ defmodule EXLA.Defn do
         end)
       end)
 
-    if MapSet.size(donated_leaf_set) > 0 and mesh != nil do
-      raise ArgumentError,
-            "buffer donation is not currently supported with sharded execution"
-    end
-
     disk_key = %{
       client: client.name,
       args: args_key,

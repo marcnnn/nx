@@ -165,7 +165,7 @@ defmodule EXLA.Defn.ShardingTest do
       expected_mlir = """
       module {
         sdy.mesh @mesh = <["axis_0"=2, "axis_1"=2]>
-        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0, {"axis_1", ?}p0]>}, %arg2: tensor<8x1xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0, {?}p0]>}) -> tensor<8x2xi32> {
+        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}, {"axis_1"}]>}, %arg2: tensor<8x1xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}, {}]>}) -> tensor<8x2xi32> {
           %0 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x2xi32>
           %1 = stablehlo.add %arg1, %0 : tensor<8x2xi32>
           return %1 : tensor<8x2xi32>
@@ -212,7 +212,7 @@ defmodule EXLA.Defn.ShardingTest do
       expected_mlir = """
       module {
         sdy.mesh @"3d_mesh" = <["axis_0"=2, "axis_1"=1, "axis_2"=2]>
-        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<4x2x4xi32> {sdy.sharding = #sdy.sharding<@"3d_mesh", [{"axis_0", ?}p0, {"axis_1", ?}p0, {"axis_2", ?}p0]>}) -> tensor<4x2x4xi32> {
+        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<4x2x4xi32> {sdy.sharding = #sdy.sharding<@"3d_mesh", [{"axis_0"}, {"axis_1"}, {"axis_2"}]>}) -> tensor<4x2x4xi32> {
           %c = stablehlo.constant dense<2> : tensor<i32>
           %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<4x2x4xi32>
           %1 = stablehlo.multiply %0, %arg1 : tensor<4x2x4xi32>
@@ -261,7 +261,7 @@ defmodule EXLA.Defn.ShardingTest do
       expected_mlir = """
       module {
         sdy.mesh @mesh = <["axis_0"=2, "axis_1"=2]>
-        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", "axis_1", ?}p0, {?}p0]>}) -> tensor<4x4xi32> {
+        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<4x4xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", "axis_1"}, {}]>}) -> tensor<4x4xi32> {
           %0 = stablehlo.transpose %arg1, dims = [1, 0] : (tensor<4x4xi32>) -> tensor<4x4xi32>
           return %0 : tensor<4x4xi32>
         }
@@ -344,7 +344,7 @@ defmodule EXLA.Defn.ShardingTest do
       expected_mlir = """
       module {
         sdy.mesh @mesh = <["axis_0"=2, "axis_1"=2]>
-        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0, {"axis_1", ?}p0]>}, %arg2: tensor<8x1xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0, {?}p0]>}, %arg3: tensor<8x1xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0, {?}p0]>}) -> tensor<8x2xi32> {
+        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}, {"axis_1"}]>}, %arg2: tensor<8x1xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}, {}]>}, %arg3: tensor<8x1xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}, {}]>}) -> tensor<8x2xi32> {
           %0 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x2xi32>
           %1 = stablehlo.multiply %arg1, %0 : tensor<8x2xi32>
           %2 = stablehlo.broadcast_in_dim %arg3, dims = [0, 1] : (tensor<8x1xi32>) -> tensor<8x2xi32>
@@ -621,6 +621,22 @@ defmodule EXLA.Defn.ShardingTest do
       assert is_binary(result.mlir_module)
     end
 
+    test "keeps replicated arguments replicated next to sharded ones" do
+      # Propagation must not shard w like x, since every device passes all of w
+      fun = fn x, w -> Nx.add(x, w) end
+      mesh = %Mesh{name: "mesh", shape: {2}}
+      w = Nx.tensor([10, 20, 30, 40])
+
+      [r0, r1] =
+        EXLA.shard_jit(fun, mesh, client: :host, input_shardings: [%{0 => [0]}, %{}]).([
+          [Nx.tensor([1, 2]), w],
+          [Nx.tensor([3, 4]), w]
+        ])
+
+      assert_equal(r0, Nx.tensor([11, 22]))
+      assert_equal(r1, Nx.tensor([33, 44]))
+    end
+
     test "handles scalar input" do
       fun = fn x -> Nx.add(x, 1) end
 
@@ -888,7 +904,7 @@ defmodule EXLA.Defn.ShardingTest do
       expected_mlir = """
       module {
         sdy.mesh @mesh = <["axis_0"=2, "axis_1"=2]>
-        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0, {"axis_1", ?}p0]>}) -> tensor<8x2xi32> {
+        func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<8x2xi32> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}, {"axis_1"}]>}) -> tensor<8x2xi32> {
           %c = stablehlo.constant dense<1> : tensor<i32>
           %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i32>) -> tensor<8x2xi32>
           %1 = stablehlo.add %0, %arg1 : tensor<8x2xi32>
@@ -984,7 +1000,7 @@ defmodule EXLA.Defn.ShardingTest do
         assert result.mlir_module == """
                module {
                  sdy.mesh @mesh = <["axis_0"=2, "axis_1"=2]>
-                 func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<2x#{unquote(type_string)}> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0", ?}p0]>}) -> tensor<2x#{unquote(type_string)}> {
+                 func.func public @main(%arg0: #{callback_pid_tensor_type()}, %arg1: tensor<2x#{unquote(type_string)}> {sdy.sharding = #sdy.sharding<@mesh, [{"axis_0"}]>}) -> tensor<2x#{unquote(type_string)}> {
                    %0 = stablehlo.add %arg1, %arg1 : tensor<2x#{unquote(type_string)}>
                    return %0 : tensor<2x#{unquote(type_string)}>
                  }
