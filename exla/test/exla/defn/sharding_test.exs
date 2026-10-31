@@ -427,6 +427,18 @@ defmodule EXLA.Defn.ShardingTest do
     end
   end
 
+  describe "argument lists per device" do
+    @moduletag :multi_device
+    test "raises when there is not one argument list per device of the mesh" do
+      mesh = %Mesh{name: "mesh", shape: {2}}
+      sum = EXLA.shard_jit(&Nx.sum/1, mesh, client: :host, input_shardings: [%{0 => [0]}])
+
+      assert_raise ArgumentError, ~r/expected 2 argument lists, one for each partition/, fn ->
+        sum.([[Nx.tensor([1.0, 2.0])]])
+      end
+    end
+  end
+
   describe "mesh validation" do
     test "raises when input_shardings provided without mesh" do
       fun = fn x -> Nx.add(x, 1) end

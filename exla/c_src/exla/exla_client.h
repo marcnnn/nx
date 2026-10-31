@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -159,7 +160,12 @@ public:
       std::unique_ptr<xla::DistributedRuntimeService> service)
       : service_(std::move(service)) {}
 
-  ~ExlaDistributedService() { service_->Shutdown(); }
+  // Shutdown waits for the connected clients, so it must not block the
+  // scheduler thread that runs the resource destructor
+  ~ExlaDistributedService() {
+    std::thread([service = std::move(service_)]() { service->Shutdown(); })
+        .detach();
+  }
 
 private:
   std::unique_ptr<xla::DistributedRuntimeService> service_;
