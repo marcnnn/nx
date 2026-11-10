@@ -317,7 +317,12 @@ mlir_compile(ErlNifEnv *env, fine::ResourcePtr<ExlaClient> client,
   auto compile_portable_executable = false;
   if (device_id >= 0) {
     compile_portable_executable = true;
-    build_options.set_device_ordinal(device_id);
+    // device_id is global, the build options want the ordinal of the device
+    // in this process. Both are the same unless the client spans several
+    // processes.
+    auto device = unwrap(
+        client->client()->LookupDevice(xla::GlobalDeviceId(device_id)));
+    build_options.set_device_ordinal(device->local_device_id().value());
   }
 
   return unwrap(client->Compile(module->module(), argument_layouts,
